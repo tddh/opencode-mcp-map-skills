@@ -354,7 +354,9 @@ const createPlugin = async (ctx: PluginContext) => {
         id: `mcp-map-skills-${Date.now()}-${Math.random().toString(36).slice(2)}`,
         role: "user",
       }
-      messages.push({ info, parts: [{ type: "text", text: wrap(parts) }] })
+      // 用 splice 而非 push 插到「最新用户输入之前」：此 hook 触发时 messages 已含最新输入，
+      // push 到末尾会让规则成为最新一条 user、被当成指令而非约束。另须原地改数组——重赋值 output.messages 静默失效（issue #25754）。
+      messages.splice(-1, 0, { info, parts: [{ type: "text", text: wrap(parts) }] })
     },
   }
 }

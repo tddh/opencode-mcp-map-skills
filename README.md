@@ -1,6 +1,6 @@
 # mcp-map-skills
 
-OpenCode 插件：通用的「MCP → Skill」自动加载框架。通过配置把任意 MCP 绑定到任意 Skill，当 Agent 使用某个 MCP 工具时，自动将对应 Skill 的规则全文注入到对话上下文末尾（生成点附近），确保规则不因长对话或 context compaction 被遗忘。
+OpenCode 插件：通用的「MCP → Skill」自动加载框架。通过配置把任意 MCP 绑定到任意 Skill，当 Agent 使用某个 MCP 工具时，自动将对应 Skill 的规则全文注入到最新用户输入之前（紧邻生成点），确保规则不因长对话或 context compaction 被遗忘。
 
 ## 解决的问题
 
@@ -13,7 +13,7 @@ OpenCode 插件：通用的「MCP → Skill」自动加载框架。通过配置�
 ```
 模型调用 MCP 工具（如 clum_host_list）
   → tool.execute.before 识别 MCP → 标记 skill 激活
-  → messages.transform 按 token 间隔刷新注入到对话末尾
+  → messages.transform 按 token 间隔刷新注入到最新用户输入之前
 ```
 
 - **token 驱动刷新**：skill 每累积 `refreshTokens`（默认 20000）token 才重新注入一次——注意力随 token 数量衰减（而非轮数），在尚未明显衰减前不重复注入，省 token
