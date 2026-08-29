@@ -12,11 +12,13 @@ OpenCode 插件：通用的「MCP → Skill」自动加载框架。通过配置�
 
 ```
 模型调用 MCP 工具（如 clum_host_list）
-  → tool.execute.before 识别 MCP → 标记会话已激活
-  → experimental.chat.messages.transform 注入 skill 全文到对话末尾
+  → tool.execute.before 识别 MCP → 标记 skill 激活
+  → messages.transform 按 token 间隔刷新注入到对话末尾
 ```
 
-- **注入到生成点附近**：skill 内容以一条 user 消息注入到对话末尾，紧邻模型生成点（注意力权重最高）；每轮请求重新注入，不依赖历史消息保留，抗 compaction
+- **token 驱动刷新**：skill 每累积 `refreshTokens`（默认 20000）token 才重新注入一次——注意力随 token 数量衰减（而非轮数），在尚未明显衰减前不重复注入，省 token
+- **自动失效**：连续 `inactiveTokens`（默认 60000）token 未再触发对应 MCP，skill 自动失效、停止注入
+- **抗 compaction**：检测到对话历史被裁剪（token 回退）时强制重注入
 - **按会话隔离**：session A 激活的 skill 不影响 session B
 - **未激活零开销**：没用任何 MCP 时不注入任何内容
 
@@ -40,13 +42,17 @@ OpenCode 启动时自动加载 `~/.config/opencode/plugins/` 下的 `.ts` 文件
 {
   "mcpSkillBindings": {
     "clum": "clum-mcp"
-  }
+  },
+  "refreshTokens": 20000,
+  "inactiveTokens": 60000
 }
 ```
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `mcpSkillBindings` | `Record<string, string>` | 是 | MCP 名 → skill 名 映射。key 是 MCP 工具名的**前缀**（如 `clum` 匹配 `clum_exec`） |
+| `refreshTokens` | `number` | 否 | 活跃 skill 每累积这么多 token 重新注入一次（刷新注意力），默认 20000 |
+| `inactiveTokens` | `number` | 否 | 距离上次 MCP 触发超过这个 token 量则失效（停止注入），默认 60000 |
 
 ### 3. 确保 Skill 存在
 

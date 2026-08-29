@@ -1,6 +1,6 @@
 // 单文件（非多文件）实现：OpenCode 会将 plugins 目录下每个 .ts 独立作为插件加载，
 // 多文件相对 import 存在加载歧义风险。逻辑模块对应 docs/design.md，本文件按
-// config / skill-loader / session / hooks 分节。
+// types / config / skill-loader / session / hooks 分节。
 
 import { readFileSync, existsSync } from "node:fs"
 import { join } from "node:path"
@@ -54,6 +54,15 @@ interface TransformOutput {
 
 interface McpMapConfig {
   mcpSkillBindings: Record<string, string>
+  refreshTokens: number
+  inactiveTokens: number
+}
+
+const DEFAULT_REFRESH_TOKENS = 20000
+const DEFAULT_INACTIVE_TOKENS = 60000
+
+function positiveNumber(v: unknown): number | null {
+  return typeof v === "number" && v > 0 && Number.isFinite(v) ? v : null
 }
 
 function loadConfig(projectDir: string, log: LogFn): McpMapConfig | null {
@@ -78,7 +87,12 @@ function loadConfig(projectDir: string, log: LogFn): McpMapConfig | null {
             (v) => typeof v === "string",
           )
         ) {
-          return { mcpSkillBindings: bindings as Record<string, string> }
+          const cfg = parsed as Record<string, unknown>
+          return {
+            mcpSkillBindings: bindings as Record<string, string>,
+            refreshTokens: positiveNumber(cfg.refreshTokens) ?? DEFAULT_REFRESH_TOKENS,
+            inactiveTokens: positiveNumber(cfg.inactiveTokens) ?? DEFAULT_INACTIVE_TOKENS,
+          }
         }
         log("warn", `配置的 mcpSkillBindings 字段无效（需为 string→string 映射）: ${p}`)
         return null
@@ -159,26 +173,75 @@ function getSkill(
 // session
 // ---------------------------------------------------------------------------
 
+interface SkillState {
+  lastActiveAt: number // 上次被对应 MCP 触发的对话 token 位置
+  lastInjectedAt: number | null // 上次注入的对话 token 位置（null = 尚未注入）
+}
+
 class SessionManager {
-  // 会话数上限：超出时清理最早激活的会话。这是防御性兜底——OpenCode 无可靠的
-  // session 结束 hook，无法精确清理；个人使用中会话数量级极小，通常不会触发。
+  // 会话数上限：超出时清理最早激活的会话。OpenCode 无可靠的 session 结束 hook，
+  // 只能按插入顺序近似清理；个人使用中会话数量级极小，通常不会触发。
   private static readonly MAX_SESSIONS = 1000
-  private sessions = new Map<string, Set<string>>()
+  private sessions = new Map<string, Map<string, SkillState>>()
+  // 每个会话「上次 messages.transform 估算的对话总 token」，作为 before 激活时的近似位置
+  private lastToken = new Map<string, number>()
 
   activate(sessionId: string, skillName: string): void {
     if (!this.sessions.has(sessionId)) {
-      this.sessions.set(sessionId, new Set())
+      this.sessions.set(sessionId, new Map())
       if (this.sessions.size > SessionManager.MAX_SESSIONS) {
         const oldest = this.sessions.keys().next().value
         if (oldest !== undefined) this.sessions.delete(oldest)
       }
     }
-    this.sessions.get(sessionId)!.add(skillName)
+    const skills = this.sessions.get(sessionId)!
+    const approx = this.lastToken.get(sessionId) ?? 0
+    const existing = skills.get(skillName)
+    if (existing) {
+      existing.lastActiveAt = approx // 再次触发 → 仅刷新活跃位置，不强制重注入
+    } else {
+      skills.set(skillName, { lastActiveAt: approx, lastInjectedAt: null })
+    }
   }
 
-  getActivated(sessionId: string): string[] {
-    const set = this.sessions.get(sessionId)
-    return set ? [...set] : []
+  // 每轮 messages.transform 调用：推进时间线，返回本轮需要注入的 skill 名
+  advance(
+    sessionId: string,
+    currentToken: number,
+    refreshTokens: number,
+    inactiveTokens: number,
+  ): string[] {
+    this.lastToken.set(sessionId, currentToken)
+    const skills = this.sessions.get(sessionId)
+    if (!skills) return []
+
+    const toInject: string[] = []
+    for (const [name, st] of skills) {
+      // 历史被裁剪：当前 token 回退到激活位置之前 → 重置基准 + 强制重注入
+      //（skill 内容很可能已被裁掉，这是防 compaction 遗忘的关键分支）
+      if (currentToken < st.lastActiveAt) {
+        st.lastActiveAt = currentToken
+        st.lastInjectedAt = null
+        toInject.push(name)
+        continue
+      }
+      // 失效：连续 inactiveTokens 未被触发 → 释放，省 token
+      if (currentToken - st.lastActiveAt > inactiveTokens) {
+        skills.delete(name)
+        continue
+      }
+      // 刷新：从未注入过，或距离上次注入已满 refreshTokens（注意力随 token 衰减）
+      const lastInjected = st.lastInjectedAt
+      if (lastInjected === null || currentToken - lastInjected >= refreshTokens) {
+        st.lastInjectedAt = currentToken
+        toInject.push(name)
+      }
+    }
+    if (skills.size === 0) {
+      this.sessions.delete(sessionId)
+      this.lastToken.delete(sessionId)
+    }
+    return toInject
   }
 }
 
@@ -201,6 +264,20 @@ function formatSkill(skill: LoadedSkill): string {
 
 function wrap(parts: string[]): string {
   return `<preloaded-skills>\n以下 skill 已因使用对应 MCP 而自动加载，请始终遵守其中的规则：\n\n${parts.join("\n\n")}\n</preloaded-skills>`
+}
+
+// 估算当前对话累计 token（chars/4，生态事实标准）。用于衡量 skill 距离生成点的
+// 注意力距离，而非精确 token 数，粗略估算已足够。
+function estimateContextTokens(messages: ChatMessage[]): number {
+  let chars = 0
+  for (const msg of messages) {
+    const parts = msg.parts
+    if (!parts) continue
+    for (const part of parts) {
+      if (typeof part.text === "string") chars += part.text.length
+    }
+  }
+  return Math.ceil(chars / 4)
 }
 
 // ---------------------------------------------------------------------------
@@ -256,7 +333,13 @@ const createPlugin = async (ctx: PluginContext) => {
       const sessionID = last?.info?.sessionID
       if (!sessionID) return
 
-      const names = sessionManager.getActivated(sessionID)
+      const currentToken = estimateContextTokens(messages)
+      const names = sessionManager.advance(
+        sessionID,
+        currentToken,
+        config.refreshTokens,
+        config.inactiveTokens,
+      )
       if (names.length === 0) return
 
       const parts: string[] = []
