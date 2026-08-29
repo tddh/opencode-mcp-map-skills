@@ -47,7 +47,6 @@ OpenCode 启动时自动加载 `~/.config/opencode/plugins/` 下的 `.ts` 文件
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `mcpSkillBindings` | `Record<string, string>` | 是 | MCP 名 → skill 名 映射。key 是 MCP 工具名的**前缀**（如 `clum` 匹配 `clum_exec`） |
-| `maxTokens` | `number` | 否 | 预留字段，当前版本**未实现**截断逻辑（代码仅声明未使用，可忽略） |
 
 ### 3. 确保 Skill 存在
 

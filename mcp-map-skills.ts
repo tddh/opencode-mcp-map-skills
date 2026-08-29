@@ -7,10 +7,46 @@ import { join } from "node:path"
 import { homedir } from "node:os"
 
 // ---------------------------------------------------------------------------
-// logger（通过 ctx.client.app.log 写入 OpenCode 日志，不污染 TUI 界面）
+// types（最小类型定义，保持零外部依赖，仅声明本插件依赖的字段）
 // ---------------------------------------------------------------------------
 
 type LogFn = (level: "info" | "warn", message: string, extra?: unknown) => void
+
+interface PluginContext {
+  directory?: string
+  client?: {
+    app?: {
+      log?: (input: {
+        body: { service: string; level: string; message: string; extra?: unknown }
+      }) => void
+    }
+  }
+}
+
+interface ToolBeforeInput {
+  tool?: string
+  sessionID?: string
+}
+
+interface MessageInfo {
+  sessionID?: string
+  id?: string
+  role?: string
+}
+
+interface MessagePart {
+  type?: string
+  text?: string
+}
+
+interface ChatMessage {
+  info?: MessageInfo
+  parts?: MessagePart[]
+}
+
+interface TransformOutput {
+  messages?: ChatMessage[]
+}
 
 // ---------------------------------------------------------------------------
 // config
@@ -18,7 +54,6 @@ type LogFn = (level: "info" | "warn", message: string, extra?: unknown) => void
 
 interface McpMapConfig {
   mcpSkillBindings: Record<string, string>
-  maxTokens?: number
 }
 
 function loadConfig(projectDir: string, log: LogFn): McpMapConfig | null {
@@ -29,11 +64,23 @@ function loadConfig(projectDir: string, log: LogFn): McpMapConfig | null {
   for (const p of candidates) {
     if (existsSync(p)) {
       try {
-        const parsed = JSON.parse(readFileSync(p, "utf-8"))
-        if (parsed && typeof parsed.mcpSkillBindings === "object") {
-          return parsed as McpMapConfig
+        const parsed: unknown = JSON.parse(readFileSync(p, "utf-8"))
+        const bindings =
+          parsed && typeof parsed === "object"
+            ? (parsed as Record<string, unknown>).mcpSkillBindings
+            : undefined
+        // 严格校验：必须是普通对象（排除 null/数组/字符串），且每个 value 都是 string
+        if (
+          bindings &&
+          typeof bindings === "object" &&
+          !Array.isArray(bindings) &&
+          Object.values(bindings as Record<string, unknown>).every(
+            (v) => typeof v === "string",
+          )
+        ) {
+          return { mcpSkillBindings: bindings as Record<string, string> }
         }
-        log("warn", `配置缺少 mcpSkillBindings 字段: ${p}`)
+        log("warn", `配置的 mcpSkillBindings 字段无效（需为 string→string 映射）: ${p}`)
         return null
       } catch (e) {
         log("warn", `配置解析失败: ${p}`, e)
@@ -51,11 +98,8 @@ function loadConfig(projectDir: string, log: LogFn): McpMapConfig | null {
 interface LoadedSkill {
   name: string
   content: string
-  tokenCount: number
   sourcePath: string
 }
-
-const skillCache = new Map<string, LoadedSkill>()
 
 function searchDirs(projectDir: string): string[] {
   return [
@@ -67,6 +111,8 @@ function searchDirs(projectDir: string): string[] {
 }
 
 function findSkillFile(name: string, projectDir: string): string | null {
+  // 防御路径遍历：skill 名不允许含上级引用或路径分隔符
+  if (name.includes("..") || name.includes("/") || name.includes("\\")) return null
   for (const dir of searchDirs(projectDir)) {
     const p = join(dir, name, "SKILL.md")
     if (existsSync(p)) return p
@@ -82,12 +128,13 @@ function stripFrontmatter(raw: string): string {
   return raw
 }
 
-function estimateTokens(text: string): number {
-  return Math.ceil(text.length / 4)
-}
-
-function getSkill(name: string, projectDir: string, log: LogFn): LoadedSkill | null {
-  const cached = skillCache.get(name)
+function getSkill(
+  name: string,
+  projectDir: string,
+  cache: Map<string, LoadedSkill>,
+  log: LogFn,
+): LoadedSkill | null {
+  const cached = cache.get(name)
   if (cached) return cached
 
   const path = findSkillFile(name, projectDir)
@@ -98,10 +145,9 @@ function getSkill(name: string, projectDir: string, log: LogFn): LoadedSkill | n
     const skill: LoadedSkill = {
       name,
       content: stripFrontmatter(raw).trim(),
-      tokenCount: estimateTokens(raw),
       sourcePath: path,
     }
-    skillCache.set(name, skill)
+    cache.set(name, skill)
     return skill
   } catch (e) {
     log("warn", `读取 SKILL.md 失败: ${name}`, e)
@@ -114,11 +160,18 @@ function getSkill(name: string, projectDir: string, log: LogFn): LoadedSkill | n
 // ---------------------------------------------------------------------------
 
 class SessionManager {
+  // 会话数上限：超出时清理最早激活的会话。这是防御性兜底——OpenCode 无可靠的
+  // session 结束 hook，无法精确清理；个人使用中会话数量级极小，通常不会触发。
+  private static readonly MAX_SESSIONS = 1000
   private sessions = new Map<string, Set<string>>()
 
   activate(sessionId: string, skillName: string): void {
     if (!this.sessions.has(sessionId)) {
       this.sessions.set(sessionId, new Set())
+      if (this.sessions.size > SessionManager.MAX_SESSIONS) {
+        const oldest = this.sessions.keys().next().value
+        if (oldest !== undefined) this.sessions.delete(oldest)
+      }
     }
     this.sessions.get(sessionId)!.add(skillName)
   }
@@ -154,7 +207,7 @@ function wrap(parts: string[]): string {
 // plugin entry
 // ---------------------------------------------------------------------------
 
-const createPlugin = async (ctx: any) => {
+const createPlugin = async (ctx: PluginContext) => {
   const projectDir: string = ctx.directory ?? process.cwd()
 
   const log: LogFn = (level, message, extra) => {
@@ -169,6 +222,7 @@ const createPlugin = async (ctx: any) => {
 
   const config = loadConfig(projectDir, log)
   const sessionManager = new SessionManager()
+  const skillCache = new Map<string, LoadedSkill>()
 
   if (!config) {
     log("warn", "未找到配置（.opencode/mcp-map-skills.json 或 ~/.config/opencode/mcp-map-skills.json），插件不生效")
@@ -176,15 +230,15 @@ const createPlugin = async (ctx: any) => {
   }
 
   return {
-    "tool.execute.before": async (input: any) => {
+    "tool.execute.before": async (input: ToolBeforeInput) => {
       const { tool, sessionID } = input
-      if (!sessionID) return
+      if (!sessionID || !tool) return
 
       const mcp = matchMcp(tool, config.mcpSkillBindings)
       if (!mcp) return
 
       const skillName = config.mcpSkillBindings[mcp]
-      const skill = getSkill(skillName, projectDir, log)
+      const skill = getSkill(skillName, projectDir, skillCache, log)
       if (!skill) {
         log("warn", `找不到 skill "${skillName}"（MCP: ${mcp}），跳过`)
         return
@@ -194,12 +248,10 @@ const createPlugin = async (ctx: any) => {
       log("info", `已激活 ${skillName}（MCP: ${mcp}，工具: ${tool}）`)
     },
 
-    "experimental.chat.messages.transform": async (_input: any, output: any) => {
-      const messages = output.messages
+    "experimental.chat.messages.transform": async (_input: unknown, output: TransformOutput) => {
+      const messages = output?.messages
       if (!messages || messages.length === 0) return
 
-      // messages.transform 的 input 是 {}，无法直接拿到 sessionID，
-      // 从最后一条消息的 info 里提取（所有消息都自带 sessionID）
       const last = messages[messages.length - 1]
       const sessionID = last?.info?.sessionID
       if (!sessionID) return
@@ -209,14 +261,12 @@ const createPlugin = async (ctx: any) => {
 
       const parts: string[] = []
       for (const name of names) {
-        const skill = getSkill(name, projectDir, log)
+        const skill = getSkill(name, projectDir, skillCache, log)
         if (skill) parts.push(formatSkill(skill))
       }
       if (parts.length === 0) return
 
-      // 注入到对话末尾：push 一条 user 消息，内容是 skill 全文，
-      // 使 skill 位于生成点附近（注意力就近），而非 system prompt 开头
-      const info = {
+      const info: MessageInfo = {
         ...last.info,
         id: `mcp-map-skills-${Date.now()}-${Math.random().toString(36).slice(2)}`,
         role: "user",
