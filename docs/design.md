@@ -43,7 +43,7 @@
 |---|---|---|
 | `tool.execute.before` | `(input: {tool, sessionID, callID}, output: {args})` | **主触发点**：只按 `input.tool` 字符串前缀匹配，不使用 args |
 | `tool.execute.after` | `(input: {tool, sessionID, callID, args}, output: {...})` | 未使用（before 触发更早且已足够） |
-| `experimental.chat.messages.transform` | `(input: {}, output: {messages})` | **主注入点**：splice 一条 user 消息到最新用户输入之前 |
+| `experimental.chat.messages.transform` | `(input: {}, output: {messages})` | **主注入点**：splice 一条 assistant 消息（含已完成 skill ToolPart）到最新用户输入之前 |
 | `experimental.chat.system.transform` | `(input: {sessionID?, model}, output: {system})` | 未使用（改用 messages.transform 注入生成点附近） |
 
 > 关键事实：`messages.transform` 的 `input` 是空对象 `{}`，**拿不到 sessionID**。sessionID 需从 `output.messages` 最后一条消息的 `info.sessionID` 里提取。
@@ -93,7 +93,7 @@ experimental.chat.messages.transform  ◀── 估算 token → session.advance
    │  读 skillLoader（.config/opencode/skills/clum-mcp/SKILL.md，带缓存）
    │                                      │
    ▼                                      ▼
-splice 一条 user 消息到最新用户输入之前  ── 按 refreshTokens 间隔刷新，紧邻生成点，抗遗忘 + 抗 compaction
+splice 一条 assistant 消息（skill 工具调用结果）到最新用户输入之前  ── 按 refreshTokens 间隔刷新，紧邻生成点，抗遗忘 + 抗 compaction
 ```
 
 ### 5.2 模块划分（单文件分节）
@@ -102,9 +102,9 @@ splice 一条 user 消息到最新用户输入之前  ── 按 refreshTokens �
 |---|---|---|
 | `types` | 最小类型定义（替代 `any`，保持零依赖） | `PluginContext` / `MessageInfo` / `ChatMessage` 等 |
 | `config` | 加载 `.opencode/mcp-map-skills.json` 或 `~/.config/opencode/mcp-map-skills.json`，解析并严格校验绑定 | `loadConfig` |
-| `skill-loader` | 定位并读取 SKILL.md（路径校验 + frontmatter 剥离 + 内存缓存） | `getSkill` / `findSkillFile` / `stripFrontmatter` |
-| `session` | 会话级状态机：`Map<sessionID, Map<skillName, SkillState>>`，token 驱动的激活/刷新/失效 | `SessionManager` |
-| `hooks` | `tool.execute.before`（触发）+ `messages.transform`（注入） | `matchMcp` / `formatSkill` / `wrap` |
+| `skill-loader` | 定位并读取 SKILL.md（路径校验 + frontmatter 解析 + 文件采样 + 内存缓存） | `getSkill` / `findSkillFile` / `parseFrontmatter` / `listSkillFiles` |
+| `session` | 会话级状态机：`Map<sessionID, Map<skillName, SkillState>>`，token/轮次驱动的激活/刷新/失效 | `SessionManager` |
+| `hooks` | `tool.execute.before`（触发）+ `messages.transform`（注入） | `matchMcp` / `formatSkillOutput` |
 | `plugin entry` | 插件入口：组装 config + loader + session + hooks，返回 `{ id, server }` | `createPlugin` / `export default` |
 
 ### 5.3 数据流
@@ -124,7 +124,7 @@ splice 一条 user 消息到最新用户输入之前  ── 按 refreshTokens �
     → 从最后一条消息 info 提取 sessionID
     → session.advance(...) 返回本轮需注入的 skill
     → 逐个取 skill 全文
-    → 拼接为 <preloaded-skills> 块，splice 一条 user 消息到最新用户输入之前
+    → 构造 skill 工具调用结果（<skill_content> 原生格式），splice 一条 assistant 消息到最新用户输入之前
 ```
 
 ### 5.4 文件结构
@@ -165,7 +165,8 @@ mcp_map_skills/
     "clum": "clum-mcp"
   },
   "refreshTokens": 20000,
-  "inactiveTokens": 60000
+  "inactiveTokens": 60000,
+  "inactiveTurns": 3
 }
 ```
 
@@ -174,6 +175,7 @@ mcp_map_skills/
 | `mcpSkillBindings` | `Record<string, string>` | 是 | MCP 名 → skill 名 的映射。key 是 MCP 工具名的**前缀**（如 `clum` 匹配 `clum_exec`） |
 | `refreshTokens` | `number` | 否 | 活跃 skill 每累积这么多 token 重新注入一次（刷新注意力），默认 20000 |
 | `inactiveTokens` | `number` | 否 | 距离上次 MCP 触发超过这个 token 量则失效，默认 60000 |
+| `inactiveTurns` | `number` | 否 | 距离上次 MCP 触发连续这么多轮（LLM 请求）未再次触发则失效，默认 3 |
 
 ### 6.2 数据模型（TypeScript）
 
@@ -183,25 +185,34 @@ interface McpMapConfig {
   mcpSkillBindings: Record<string, string>   // "clum" -> "clum-mcp"
   refreshTokens: number   // 默认 20000
   inactiveTokens: number  // 默认 60000
+  inactiveTurns: number   // 默认 3
 }
 
 // skill-loader
 interface LoadedSkill {
-  name: string          // 定位名（如 "clum-mcp"）
-  content: string       // SKILL.md 剥离 frontmatter 后 trim 的正文
+  name: string          // frontmatter 里的 name（缺失时回退到配置名）
+  content: string       // SKILL.md 剥离 frontmatter 后的正文（原样，不 trim）
   sourcePath: string    // SKILL.md 绝对路径，用于日志
+  dir: string           // SKILL.md 所在目录
 }
 
 // session
 interface SkillState {
-  lastActiveAt: number        // 上次被 MCP 触发的 token 位置
+  mcpName: string           // 触发该 skill 的 MCP 名（如 "clum"），用于注入时标注来源
+  lastActiveAt: number      // 上次被 MCP 触发的 token 位置
+  lastActiveTurn: number    // 上次被 MCP 触发的轮次（messages.transform 次数）
   lastInjectedAt: number | null // 上次注入的 token 位置（null = 尚未注入）
 }
 
+interface InjectCandidate {
+  name: string          // skill 名
+  mcpName: string       // 触发它的 MCP 名
+}
+
 class SessionManager { // MAX_SESSIONS = 1000
-  // Map<sessionID, Map<skillName, SkillState>>
-  activate(sessionId, skillName): void
-  advance(sessionId, currentToken, refreshTokens, inactiveTokens): string[]
+  // Map<sessionID, Map<skillName, SkillState>>；另按 sessionID 记录 lastToken 与 lastTurn
+  activate(sessionId, skillName, mcpName): void
+  advance(sessionId, currentToken, refreshTokens, inactiveTokens, inactiveTurns): InjectCandidate[]
 }
 ```
 
@@ -239,8 +250,8 @@ getSkill(name, cache):
   path = findSkillFile(name)                    # 按上表顺序找
   if not path: return null                      # 找不到 → 上层警告后跳过
   raw = readFile(path)
-  content = stripFrontmatter(raw).trim()        # 剥离 --- 包裹的 YAML frontmatter
-  skill = { name, content, sourcePath: path }
+  { fmName, content } = parseFrontmatter(raw)   # 解析 frontmatter 拿 name + 剥离正文
+  skill = { name: fmName ?? name, content, sourcePath: path, dir: dirname(path) }
   cache.set(name, skill)
   return skill
 ```
@@ -253,7 +264,8 @@ getSkill(name, cache):
   [未激活]  ──tool.execute.before 命中 MCP──▶  [已激活]
                  set.add(skillName)
 
-  有「失效」路径：连续超 inactiveTokens 未触发则自动反激活，插件不主动清理。
+  有「失效」路径（轮次与 token 并行，任一先到即失效）：
+  连续超 inactiveTurns 轮未触发，或连续超 inactiveTokens token 未触发，则自动反激活。
   防御性兜底：会话数超 MAX_SESSIONS(=1000) 时清理最早激活的会话
   （OpenCode 无可靠的 session 结束 hook，无法精确清理；个人使用量级极小，通常不触发）
 ```
@@ -272,7 +284,7 @@ getSkill(name, cache):
 6  if !skill:
        log.warn("找不到 skill ...", { mcp, skillName })
        return                                   # 加载失败 → 警告后继续
-7  session.activate(sessionID, skillName)
+7  session.activate(sessionID, skillName, mcp)
 8  log.info("已激活 {skillName}（MCP: {mcp}，工具: {tool}）")
 ```
 
@@ -288,36 +300,54 @@ getSkill(name, cache):
 2  last = messages[last]
 3  sessionID = last.info.sessionID               # 从最后一条消息 info 提取
 4  if !sessionID: return                         # 防御
-5  names = session.advance(sessionID, currentToken, refreshTokens, inactiveTokens)
+5  names = session.advance(sessionID, currentToken, refreshTokens, inactiveTokens, inactiveTurns)
 6  if names.empty: return                        # 未激活任何 MCP → 零注入
-7  parts = []
-8  for name in names:
+7  toolParts = []
+8  for { name } in names:
        skill = getSkill(name)
-       if skill: parts.push(formatSkill(skill))
-9  if parts.empty: return
-10 构造一条 role="user" 的消息，内容 = wrap(parts)，splice(-1, 0) 插到 messages 倒数第二位（最新用户输入之前）
+       if skill: toolParts.push(构造 completed skill ToolPart，output = formatSkillOutput(skill))
+9  if toolParts.empty: return
+10 构造一条 role="assistant" 的消息（parts = toolParts），splice(-1, 0) 插到 messages 倒数第二位（最新用户输入之前）
 ```
 
 **关键点**：
-- **注入到最新用户输入之前**，而非 system prompt 开头：skill 位于**生成点附近**（只隔一条真实用户消息，注意力就近），比 system 开头的注入更不容易被注意力衰减；同时垫在输入前，避免成为最新一条 user 消息而被当成「指令」而非「约束」。
+- **注入到最新用户输入之前**，而非 system prompt 开头：skill 位于**生成点附近**（只隔一条真实用户消息，注意力就近），比 system 开头的注入更不容易被注意力衰减。
+- **模拟 skill 工具调用结果**：注入的是一条 assistant 消息 + 已完成（completed）的 `skill` ToolPart，skill 全文放在 `state.output`——与模型真的调用 `skill(name=...)` 工具后的消息形态完全一致，走原生 tool result 通道。`role` 必须是 assistant（否则 `toModelMessagesEffect` 不识别 tool part），`error` 必须清空（否则该消息被跳过）。
 - **按 token 间隔才插入一条新消息**：因为旧的历史会被截断 / compaction，token 衰减或历史裁剪时才重新注入，才能保证 skill 始终在场。这是抗遗忘的核心。
 - token 成本近似常量：每轮插入一条（已激活 skill 合计），旧的一条会被历史窗口剔除。
 
-`formatSkill(skill)`：
+`formatSkillOutput(skill)`（完全复刻原生 SkillTool 的 output 格式，正文原样不转义）：
 
 ```
-<preloaded-skill name="clum-mcp" source="/path/to/SKILL.md">
-{content}
-</preloaded-skill>
+<skill_content name="clum-mcp">
+# Skill: clum-mcp
+
+{content.trim()}
+
+Base directory for this skill: /path/to/clum-mcp
+Relative paths in this skill (e.g., scripts/, reference/) are relative to this base directory.
+Note: file list is sampled.
+
+<skill_files>
+<file>/path/to/clum-mcp/helper.sh</file>
+</skill_files>
+</skill_content>
 ```
 
-`wrap(parts)`：
+对应 ToolPart：
 
 ```
-<preloaded-skills>
-以下 skill 已因使用对应 MCP 而自动加载，请始终遵守其中的规则：
-{parts.join("\n\n")}
-</preloaded-skills>
+{
+  type: "tool", tool: "skill", callID: "<唯一ID>",
+  state: {
+    status: "completed",
+    input: { name: "clum-mcp" },
+    output: "<上面 formatSkillOutput 的结果>",
+    title: "Loaded skill: clum-mcp",
+    metadata: { name: "clum-mcp", dir: "/path/to/clum-mcp" },
+    time: { start, end },          // 无 compacted 字段，否则 output 被清空
+  }
+}
 ```
 
 ### 6.8 边界条件与异常处理
@@ -327,8 +357,8 @@ getSkill(name, cache):
 | `messages.transform` 拿不到 sessionID | 直接 return（无会话无状态） |
 | 未配置 `mcpSkillBindings` | 一切 hook 直接短路，零开销 |
 | 配置了但 skill 文件不存在 | `tool.execute.before` 记 warn 日志，不标记激活（下次调用会重试） |
-| 同一 MCP 反复调用 | 刷新该 skill 的 `lastActiveAt`（延长活跃期），不强制重复注入 |
-| 多个 MCP 激活 | 全部注入到同一条 user 消息（`wrap` 拼接） |
+| 同一 MCP 反复调用 | 刷新该 skill 的 `lastActiveAt` 与 `lastActiveTurn`（延长活跃期），不强制重复注入 |
+| 多个 MCP 激活 | 全部作为多个 ToolPart 注入到同一条 assistant 消息 |
 | skill 名含 `..` / `/` / `\` | `findSkillFile` 直接 return null，防御路径遍历 |
 | 对话历史被裁剪（token 回退） | `advance` 检测 `currentToken < lastActiveAt`，重置基准 + 强制重注入 |
 | headless 模式 | `tool.execute.*` 不触发（#41422），功能静默失效——文档标注"仅支持 TUI 交互" |
@@ -338,7 +368,7 @@ getSkill(name, cache):
 1. **未激活零成本**：没用任何 MCP 的会话，`messages.transform` 直接 return，0 额外 token。
 2. **按会话隔离**：session A 激活了 clum，只影响 session A；session B 完全不受影响。
 3. **token 驱动刷新**：仅每累积 refreshTokens 才重新注入一次，而非每轮，大幅降低长对话平均开销。
-4. **自动失效**：连续 inactiveTokens 未触发的 skill 自动释放，不再产生注入成本。
+4. **自动失效**：连续 inactiveTurns 轮、或连续 inactiveTokens token 未触发的 skill 自动释放（任一先到即失效），不再产生注入成本。
 5. **不重复读盘**：skill 内容内存缓存，注入阶段零 IO。
 
 ### 6.10 防遗忘机制（回应 R2）
@@ -359,6 +389,8 @@ getSkill(name, cache):
 | D5 | 不注册 `skill` 同名工具 | — | 规避 #14534 双缓存分歧 |
 | D6 | token 驱动刷新（每 refreshTokens 重注入）而非每轮注入 | 每轮全量注入 | 注意力随 token 数量衰减而非轮数；每轮注入在长对话中浪费严重，token 间隔注入匹配衰减速率 |
 | D7 | inactiveTokens 自动失效 | 注入后常驻到 compaction（社区默认） | 社区无「停用」先例，但常驻在超大上下文场景浪费严重；token 失效是对官方行为的改进 |
+| D8 | inactiveTurns 轮次失效（与 token 失效并行，任一先到即失效） | 仅按 token 失效 | 偶然调用一次 MCP 后，若后续连续几轮未再用，token 阈值（60000）太宽松、skill 长时间在场浪费 token；轮次阈值更快释放 |
+| D9 | 以原生 skill 工具调用结果形态注入（assistant + completed ToolPart） | 构造 user 消息注入（`<preloaded-skill>` 包裹） | 与模型真的调 `skill` 工具后的消息形态一致，走原生 tool result 通道；正文零转义零截断；user 消息注入的祈使式包裹易触发模型注入防御 |
 
 ---
 
@@ -377,7 +409,7 @@ getSkill(name, cache):
 ## 9. 里程碑与验收
 
 - **M1（最小闭环）**：单文件插件 + 配置，实现 `clum → clum-mcp` 单映射，能"调 clum 后每轮对话里（最新用户输入之前）出现 clum-mcp 全文"。
-  - 验收：开新会话 → 调一次 `clum_host_list` → 之后每条消息里，最新用户输入之前均含 `<preloaded-skill name="clum-mcp">`。
+  - 验收：开新会话 → 调一次 `clum_host_list` → 日志出现 `已激活` 与 `已注入` 两条；模型上下文里能看到 `<skill_content name="clum-mcp">`。
 - **M2（边界加固）**：多 MCP 映射 + 加载失败警告 + 日志 + 路径校验。
 - **M3（验证）**：构造"长对话 + 触发 compaction + 再用 clum"场景，确认规则仍在场。
 - **M4（交付）**：`README.md` + 使用说明。

@@ -1,6 +1,6 @@
 # mcp-map-skills
 
-OpenCode 插件：通用的「MCP → Skill」自动加载框架。通过配置把任意 MCP 绑定到任意 Skill，当 Agent 使用某个 MCP 工具时，自动将对应 Skill 的规则全文注入到最新用户输入之前（紧邻生成点），确保规则不因长对话或 context compaction 被遗忘。
+OpenCode 插件：通用的「MCP → Skill」自动加载框架。通过配置把任意 MCP 绑定到任意 Skill，当 Agent 使用某个 MCP 工具时，自动将对应 Skill 的规则全文以「原生 skill 工具调用结果」形态注入到最新用户输入之前（紧邻生成点），确保规则不因长对话或 context compaction 被遗忘。
 
 ## 解决的问题
 
@@ -13,11 +13,12 @@ OpenCode 插件：通用的「MCP → Skill」自动加载框架。通过配置�
 ```
 模型调用 MCP 工具（如 clum_host_list）
   → tool.execute.before 识别 MCP → 标记 skill 激活
-  → messages.transform 按 token 间隔刷新注入到最新用户输入之前
+  → messages.transform 按 token 间隔，构造「skill 工具调用结果」注入到最新用户输入之前
 ```
 
+- **原生 skill 形态注入**：注入的是一条 assistant 消息 + 已完成的 `skill` ToolPart（正文原样、零转义零截断），与模型真的调用 `skill(name=...)` 工具后的消息形态完全一致
 - **token 驱动刷新**：skill 每累积 `refreshTokens`（默认 20000）token 才重新注入一次——注意力随 token 数量衰减（而非轮数），在尚未明显衰减前不重复注入，省 token
-- **自动失效**：连续 `inactiveTokens`（默认 60000）token 未再触发对应 MCP，skill 自动失效、停止注入
+- **自动失效**：连续 `inactiveTurns`（默认 3）轮、或连续 `inactiveTokens`（默认 60000）token 未再触发对应 MCP，skill 自动失效、停止注入（任一先到即失效）
 - **抗 compaction**：检测到对话历史被裁剪（token 回退）时强制重注入
 - **按会话隔离**：session A 激活的 skill 不影响 session B
 - **未激活零开销**：没用任何 MCP 时不注入任何内容
@@ -44,7 +45,8 @@ OpenCode 启动时自动加载 `~/.config/opencode/plugins/` 下的 `.ts` 文件
     "clum": "clum-mcp"
   },
   "refreshTokens": 20000,
-  "inactiveTokens": 60000
+  "inactiveTokens": 60000,
+  "inactiveTurns": 3
 }
 ```
 
@@ -53,6 +55,7 @@ OpenCode 启动时自动加载 `~/.config/opencode/plugins/` 下的 `.ts` 文件
 | `mcpSkillBindings` | `Record<string, string>` | 是 | MCP 名 → skill 名 映射。key 是 MCP 工具名的**前缀**（如 `clum` 匹配 `clum_exec`） |
 | `refreshTokens` | `number` | 否 | 活跃 skill 每累积这么多 token 重新注入一次（刷新注意力），默认 20000 |
 | `inactiveTokens` | `number` | 否 | 距离上次 MCP 触发超过这个 token 量则失效（停止注入），默认 60000 |
+| `inactiveTurns` | `number` | 否 | 距离上次 MCP 触发连续这么多轮（LLM 请求）未再次触发则失效（停止注入），默认 3 |
 
 ### 3. 确保 Skill 存在
 
@@ -67,8 +70,8 @@ Skill 文件需位于以下任一目录（按优先级搜索）：
 
 1. 重启 OpenCode
 2. 新会话中调用一次目标 MCP 工具（如 `clum_host_list`）
-3. 观察 OpenCode 日志（日志文件，非 TUI 界面）出现 `[mcp-map-skills] 已激活 clum-mcp（MCP: clum，工具: clum_host_list）` 行
-4. 后续任意消息中，模型应自动遵守 skill 规则
+3. 观察 OpenCode 日志（日志文件，非 TUI 界面）出现两条：`[mcp-map-skills] 已激活 clum-mcp（MCP: clum，工具: clum_host_list）` 和 `[mcp-map-skills] 已注入 1 个 skill（clum-mcp）`
+4. 后续任意消息中，模型应自动遵守 skill 规则（上下文里能看到 `<skill_content name="clum-mcp">` 即注入成功）
 
 ## 配置任意 MCP 映射
 
