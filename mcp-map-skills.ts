@@ -28,6 +28,11 @@ interface ToolBeforeInput {
   sessionID?: string
 }
 
+// tool.execute.before 的第二个参数：完整工具参数在此（input 里拿不到 args）
+interface ToolBeforeOutput {
+  args?: unknown
+}
+
 interface MessageInfo {
   sessionID?: string
   id?: string
@@ -40,20 +45,10 @@ interface MessageInfo {
 interface MessagePart {
   type?: string
   text?: string
-  // tool part 字段（模拟 skill 工具调用结果时使用）
+  synthetic?: boolean
   id?: string
   sessionID?: string
   messageID?: string
-  tool?: string
-  callID?: string
-  state?: {
-    status?: string
-    input?: Record<string, unknown>
-    output?: string
-    title?: string
-    metadata?: Record<string, unknown>
-    time?: { start: number; end: number }
-  }
   metadata?: Record<string, unknown>
 }
 
@@ -306,6 +301,42 @@ function matchMcp(tool: string, bindings: Record<string, string>): string | null
   return null
 }
 
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+// 识别触发 skill 的 MCP 名，返回命中列表（空 = 非目标调用）。
+// 三条路径：
+//   1. 直接 MCP 调用（clum_exec 等）→ 前缀匹配；新版 opencode 的 code-mode 子调用会以子工具名重触发本 hook，同样走这里
+//   2. execute（code-mode 沙箱）→ 旧版不重触发子 hook，需解析 args.code 里的 tools.<server>. 调用兜底
+//   3. skill_mcp（oh-my-openagent 插件）→ 内部用自有 client 直连、绝不重触发，需读 args.mcp_name
+function resolveMcp(tool: string, args: unknown, bindings: Record<string, string>): string[] {
+  const direct = matchMcp(tool, bindings)
+  if (direct) return [direct]
+
+  if (!args || typeof args !== "object") return []
+  const obj = args as Record<string, unknown>
+
+  if (tool === "execute") {
+    const code = obj.code
+    if (typeof code !== "string") return []
+    const found: string[] = []
+    for (const server of Object.keys(bindings)) {
+      const re = new RegExp(`tools\\.${escapeRegExp(server)}(?:\\.|\\[)`)
+      if (re.test(code)) found.push(server)
+    }
+    return found
+  }
+
+  if (tool === "skill_mcp") {
+    const mcpName = obj.mcp_name
+    if (typeof mcpName === "string" && bindings[mcpName]) return [mcpName]
+    return []
+  }
+
+  return []
+}
+
 // 采样 skill 目录下的非 SKILL.md 文件（对齐原生 SkillTool 的 ripgrep 采样行为）
 function listSkillFiles(dir: string, limit = 10): string[] {
   const result: string[] = []
@@ -390,22 +421,23 @@ const createPlugin = async (ctx: PluginContext) => {
   }
 
   return {
-    "tool.execute.before": async (input: ToolBeforeInput) => {
+    "tool.execute.before": async (input: ToolBeforeInput, output: ToolBeforeOutput) => {
       const { tool, sessionID } = input
       if (!sessionID || !tool) return
 
-      const mcp = matchMcp(tool, config.mcpSkillBindings)
-      if (!mcp) return
+      const mcps = resolveMcp(tool, output?.args, config.mcpSkillBindings)
+      if (mcps.length === 0) return
 
-      const skillName = config.mcpSkillBindings[mcp]
-      const skill = getSkill(skillName, projectDir, skillCache, log)
-      if (!skill) {
-        log("warn", `找不到 skill "${skillName}"（MCP: ${mcp}），跳过`)
-        return
+      for (const mcp of mcps) {
+        const skillName = config.mcpSkillBindings[mcp]
+        const skill = getSkill(skillName, projectDir, skillCache, log)
+        if (!skill) {
+          log("warn", `找不到 skill "${skillName}"（MCP: ${mcp}），跳过`)
+          continue
+        }
+        sessionManager.activate(sessionID, skillName, mcp)
+        log("info", `已激活 ${skillName}（MCP: ${mcp}，工具: ${tool}）`)
       }
-
-      sessionManager.activate(sessionID, skillName, mcp)
-      log("info", `已激活 ${skillName}（MCP: ${mcp}，工具: ${tool}）`)
     },
 
     "experimental.chat.messages.transform": async (_input: unknown, output: TransformOutput) => {
@@ -428,43 +460,45 @@ const createPlugin = async (ctx: PluginContext) => {
 
       const now = Date.now()
       const messageId = `mcp-map-skills-${now}-${Math.random().toString(36).slice(2)}`
-      const toolParts: MessagePart[] = []
+      const textParts: MessagePart[] = []
       const injectedNames: string[] = []
       for (const { name } of names) {
         const skill = getSkill(name, projectDir, skillCache, log)
         if (!skill) continue
         injectedNames.push(skill.name)
-        toolParts.push({
+        textParts.push({
           id: `mcp-map-skills-part-${now}-${Math.random().toString(36).slice(2)}`,
           sessionID,
           messageID: messageId,
-          type: "tool",
-          tool: "skill",
-          callID: `mcp-map-skills-call-${now}-${Math.random().toString(36).slice(2)}`,
-          state: {
-            status: "completed",
-            input: { name: skill.name },
-            output: formatSkillOutput(skill),
-            title: `Loaded skill: ${skill.name}`,
-            metadata: { name: skill.name, dir: skill.dir },
-            time: { start: now, end: now },
-          },
+          type: "text",
+          text: formatSkillOutput(skill),
+          synthetic: true,
         })
       }
-      if (toolParts.length === 0) return
+      if (textParts.length === 0) return
 
-      // 构造 assistant 消息 + 已完成 skill ToolPart，模拟「模型已调用 skill 工具」，
-      // 让 skill 内容以原生 tool result 形态进入上下文。role 必须是 assistant，
-      // 否则 toModelMessagesEffect 不识别 tool part；error 必须清空，否则该消息被跳过。
+      // 构造 assistant 消息 + synthetic 文本 part，把 skill 全文注入到「最后一条 user 消息之前」。
+      // role 必须用 assistant 而非 user：user 会让 LLM 把 skill 内容误当作用户输入。
+      // 旧版伪造 completed ToolPart（callID 无配对 tool call）序列化时被丢弃，是「不生效」根因；
+      // text part 一定进入 LLM 上下文，synthetic 标记为合成消息（非真实对话内容）。
       const info: MessageInfo = {
-        ...last.info,
         id: messageId,
         role: "assistant",
-        error: undefined,
+        sessionID,
       }
-      // 用 splice 而非 push 插到「最新用户输入之前」；原地改数组，重赋值 output.messages 静默失效（issue #25754）
-      messages.splice(-1, 0, { info, parts: toolParts })
-      log("info", `已注入 ${toolParts.length} 个 skill（${injectedNames.join(", ")}）`)
+      let lastUserIndex = -1
+      for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i]?.info?.role === "user") {
+          lastUserIndex = i
+          break
+        }
+      }
+      if (lastUserIndex === -1) {
+        messages.push({ info, parts: textParts })
+      } else {
+        messages.splice(lastUserIndex, 0, { info, parts: textParts })
+      }
+      log("info", `已注入 ${textParts.length} 个 skill（${injectedNames.join(", ")}）`)
     },
   }
 }

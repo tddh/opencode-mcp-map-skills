@@ -41,7 +41,7 @@
 
 | Hook | 签名要点 | 对本插件的影响 |
 |---|---|---|
-| `tool.execute.before` | `(input: {tool, sessionID, callID}, output: {args})` | **主触发点**：只按 `input.tool` 字符串前缀匹配，不使用 args |
+| `tool.execute.before` | `(input: {tool, sessionID, callID}, output: {args})` | **主触发点**：按 `input.tool` 前缀匹配 + 解析 `output.args` 识别 `execute` / `skill_mcp` 间接调用 |
 | `tool.execute.after` | `(input: {tool, sessionID, callID, args}, output: {...})` | 未使用（before 触发更早且已足够） |
 | `experimental.chat.messages.transform` | `(input: {}, output: {messages})` | **主注入点**：splice 一条 assistant 消息（含已完成 skill ToolPart）到最新用户输入之前 |
 | `experimental.chat.system.transform` | `(input: {sessionID?, model}, output: {system})` | 未使用（改用 messages.transform 注入生成点附近） |
@@ -52,7 +52,7 @@
 
 | 坑 | 编号 / 状态 | 规避 |
 |---|---|---|
-| `tool.execute.before` **拿不到 MCP 工具的 args** | #18489（open） | 只按 `input.tool` 字符串前缀匹配，不用 MCP 参数 |
+| `tool.execute.before` 的 args 在**第二个参数** `output.args`，**不在 input 里** | #18489（open） | 插件只声明 `input` 会漏掉参数；须同时声明 `output` 才能读 `output.args` |
 | `tool.definition` 对 MCP 工具**不触发** | #41297 | 不用 tool.definition 注入 |
 | headless 模式（`opencode run`）下 `tool.execute.*` **不触发** | #41422（open） | 明确支持范围为 TUI 交互会话 |
 | 插件注册名为 `skill` 的工具会**覆盖原生 SkillTool** | #14534 | 不注册任何名为 `skill` 的工具 |
@@ -216,22 +216,42 @@ class SessionManager { // MAX_SESSIONS = 1000
 }
 ```
 
-### 6.3 MCP 识别逻辑（`matchMcp`）
+### 6.3 MCP 识别逻辑（`resolveMcp`）
 
-**输入**：`tool`（如 `clum_exec`）；**输出**：命中的 MCP 名或 `null`。
+**输入**：`tool`（工具名）+ `args`（`output.args` 完整参数）；**输出**：命中的 MCP 名列表（空 = 非目标调用）。
 
 ```
-function matchMcp(tool, bindings):
-  for server in keys(bindings):
-    if tool === server or tool.startsWith(server + "_"):
-      return server
-  return null
+function resolveMcp(tool, args, bindings) -> string[]:
+  # 路径 1：直接前缀匹配（覆盖直接 MCP 调用 + 新版 code-mode 子调用重触发）
+  direct = matchMcp(tool, bindings)          # tool === server 或 tool.startsWith(server + "_")
+  if direct: return [direct]
+
+  if !args or typeof args != "object": return []
+  obj = args as object
+
+  # 路径 2：execute（code-mode 沙箱）——旧版不重触发子 hook，解析 code 兜底
+  if tool == "execute":
+    code = obj.code
+    if typeof code != "string": return []
+    found = []
+    for server in keys(bindings):
+      if code 匹配 /tools\.<server>(?:\.|\[)/:  found.push(server)
+    return found
+
+  # 路径 3：skill_mcp（oh-my-openagent 插件）——内部直连绝不重触发，读 mcp_name
+  if tool == "skill_mcp":
+    mcpName = obj.mcp_name
+    if typeof mcpName == "string" and bindings[mcpName]: return [mcpName]
+    return []
+
+  return []
 ```
 
 **关键设计点**：
-- 用**显式前缀**而非"从工具名反解 server"——规避 sanitize 不可逆问题；
-- 前缀判断加 `_` 分隔符，避免 `clum` 误匹配 `clumpro`（若存在）；
-- 配置 key 由用户保证与实际 tool 前缀一致；文档中注明"如遇含 `-`/`.` 的 server 名，请在配置中写清 sanitize 后的前缀"。
+- **路径 1** 沿用 `matchMcp` 的显式前缀匹配（规避 sanitize 不可逆、`_` 分隔符防误匹配）。新版 opencode 的 code-mode 子调用会以子工具名（`clum_exec`）重新触发本 hook，自动落入此路径；
+- **路径 2** 是旧版兜底：旧版 code-mode 不重触发子 hook，只在外层触发 `tool === "execute"`，需用正则扫描 `args.code` 里的 `tools.<server>.` / `tools.<server>[` 调用（`context7["query-docs"]` 这类带连字符工具名用方括号访问，故同时匹配 `.` 与 `[`）；
+- **路径 3** 是确定性缺口：`skill_mcp` 内部用自己的 MCP client 直连、**不经过 opencode 工具循环**，绝不重触发子 hook，只能读 `args.mcp_name`（server 名，如 `"clum"`）与 `args.tool_name`；
+- 三条路径均返回 `string[]`，`execute` 的 code 里若同时调用多个 MCP（`tools.clum.*` + `tools.context7.*`），一次性全部命中。
 
 ### 6.4 Skill 加载逻辑（`skill-loader`）
 
@@ -273,22 +293,23 @@ getSkill(name, cache):
 ### 6.6 `tool.execute.before` 处理流程
 
 ```
-输入: { tool, sessionID, callID }
+输入: (input: { tool, sessionID, callID }, output: { args })
 输出: （不改动）
 
-1  if !sessionID: return                        # 防御
-2  mcp = matchMcp(tool, config.mcpSkillBindings)
-3  if !mcp: return                              # 非目标 MCP，忽略
-4  skillName = config.mcpSkillBindings[mcp]
-5  skill = getSkill(skillName)
-6  if !skill:
-       log.warn("找不到 skill ...", { mcp, skillName })
-       return                                   # 加载失败 → 警告后继续
-7  session.activate(sessionID, skillName, mcp)
-8  log.info("已激活 {skillName}（MCP: {mcp}，工具: {tool}）")
+1  if !sessionID or !tool: return               # 防御
+2  mcps = resolveMcp(tool, output.args, config.mcpSkillBindings)
+3  if mcps.empty: return                        # 非目标 MCP，忽略
+4  for mcp in mcps:
+5    skillName = config.mcpSkillBindings[mcp]
+6    skill = getSkill(skillName)
+7    if !skill:
+         log.warn("找不到 skill ...", { mcp, skillName })
+         continue                              # 加载失败 → 警告后继续
+8    session.activate(sessionID, skillName, mcp)
+9    log.info("已激活 {skillName}（MCP: {mcp}，工具: {tool}）")
 ```
 
-> 注：`tool.execute.before` 在「工具真正执行前」触发，比 `after` 更早地把 skill 标记为激活，使紧接着的下一个 LLM 请求就能注入。
+> 注：`tool.execute.before` 在「工具真正执行前」触发，比 `after` 更早地把 skill 标记为激活，使紧接着的下一个 LLM 请求就能注入。`execute`（code-mode）在子工具逐个执行时还会以子工具名各触发一次本 hook（新版），与路径 2 的兜底解析共存、幂等无害。
 
 ### 6.7 `experimental.chat.messages.transform` 处理流程
 
@@ -391,18 +412,21 @@ Note: file list is sampled.
 | D7 | inactiveTokens 自动失效 | 注入后常驻到 compaction（社区默认） | 社区无「停用」先例，但常驻在超大上下文场景浪费严重；token 失效是对官方行为的改进 |
 | D8 | inactiveTurns 轮次失效（与 token 失效并行，任一先到即失效） | 仅按 token 失效 | 偶然调用一次 MCP 后，若后续连续几轮未再用，token 阈值（60000）太宽松、skill 长时间在场浪费 token；轮次阈值更快释放 |
 | D9 | 以原生 skill 工具调用结果形态注入（assistant + completed ToolPart） | 构造 user 消息注入（`<preloaded-skill>` 包裹） | 与模型真的调 `skill` 工具后的消息形态一致，走原生 tool result 通道；正文零转义零截断；user 消息注入的祈使式包裹易触发模型注入防御 |
+| D10 | 识别三条 MCP 触发路径（直接前缀 / execute code / skill_mcp mcp_name） | 仅前缀匹配（旧） | Agent 会经 `execute` 沙箱或 `skill_mcp` 插件间接调 MCP，顶层工具名不再是 `clum_exec`，单靠前缀匹配漏判；`tool.execute.before` 的 `output.args` 可读完整参数，据此补齐两条间接路径 |
 
 ---
 
 ## 8. 已知坑清单（实现时必须遵守）
 
-1. `tool.execute.before` 无 MCP args（#18489）→ 只用 tool 名前缀。
+1. `tool.execute.before` 的 args 在第二个参数 `output.args`（不在 `input` 里，见 #18489）→ 插件必须声明 `output` 才能读参数；只声明 `input` 会漏掉 `execute` / `skill_mcp` 的间接调用。
 2. `tool.definition` 对 MCP 不触发（#41297）→ 不用它注入。
 3. headless 不触发 `tool.execute.*`（#41422）→ 支持范围 = TUI。
 4. 不注册 `skill` 工具（#14534）。
 5. MCP 工具名前缀不可逆（sanitize）→ 配置显式声明前缀。
 6. 默认导出必须是 `{ id, server }` 结构（OpenCode v1 loader 对 raw function 默认导出会遍历具名导出并报错）。
 7. `messages.transform` 的 `input` 是空对象 → sessionID 必须从 `output.messages` 最后一条的 `info.sessionID` 提取，不能依赖 `input.sessionID`。
+8. `execute`（code-mode）旧版不重触发子工具 hook → 需解析 `args.code`；新版会以子工具名重触发（`code-mode.ts#L134-145`），两条路径幂等共存。
+9. `skill_mcp`（oh-my-openagent 插件）内部用自有 client 直连、绝不重触发子工具 hook → 只能读 `args.mcp_name` / `args.tool_name`。
 
 ---
 

@@ -16,6 +16,16 @@ OpenCode 插件：通用的「MCP → Skill」自动加载框架。通过配置�
   → messages.transform 按 token 间隔，构造「skill 工具调用结果」注入到最新用户输入之前
 ```
 
+`tool.execute.before` 识别 MCP 时覆盖三种调用路径（`input.tool` 前缀 + `output.args` 参数）：
+
+| 调用方式 | 顶层工具名 | 识别依据 |
+|---|---|---|
+| 直接调用 MCP 工具 | `clum_exec` | `input.tool` 前缀匹配 |
+| 经 `execute` 沙箱间接调用 | `execute` | 解析 `output.args.code` 里的 `tools.clum.` / `tools.clum[` 调用 |
+| 经 `skill_mcp` 插件间接调用 | `skill_mcp` | 读 `output.args.mcp_name`（如 `"clum"`） |
+
+> 新版 opencode 的 code-mode 子调用会以子工具名（`clum_exec`）重新触发 hook，自动落入第一行；旧版无此行为，靠第二行兜底。`skill_mcp` 内部直连、绝不重触发，只能靠第三行。
+
 - **原生 skill 形态注入**：注入的是一条 assistant 消息 + 已完成的 `skill` ToolPart（正文原样、零转义零截断），与模型真的调用 `skill(name=...)` 工具后的消息形态完全一致
 - **token 驱动刷新**：skill 每累积 `refreshTokens`（默认 20000）token 才重新注入一次——注意力随 token 数量衰减（而非轮数），在尚未明显衰减前不重复注入，省 token
 - **自动失效**：连续 `inactiveTurns`（默认 3）轮、或连续 `inactiveTokens`（默认 60000）token 未再触发对应 MCP，skill 自动失效、停止注入（任一先到即失效）
@@ -104,6 +114,7 @@ mcp_map_skills/
 - **仅支持 TUI 交互模式**：headless 模式（`opencode run`）下 `tool.execute.*` 不触发（OpenCode issue #41422）
 - **MCP 工具名不可逆**：OpenCode 对 MCP 工具名做 sanitize（`-`/`.` → `_`），因此配置中必须显式声明 server 前缀，不能从工具名反解
 - **不注册 `skill` 工具**：规避 OpenCode issue #14534（双缓存分歧）
+- **间接调用的识别依赖 `output.args`**：`tool.execute.before` 的工具参数在第二个参数 `output.args`（非 `input`）。`execute` 沙箱路径靠正则解析 `code`，`skill_mcp` 路径靠 `mcp_name`——若未来 OpenCode 改变这两者的参数结构，识别可能失效
 
 ## License
 
