@@ -211,11 +211,16 @@ class SessionManager {
   // 会话数上限：超出时清理最早激活的会话。OpenCode 无可靠的 session 结束 hook，
   // 只能按插入顺序近似清理；个人使用中会话数量级极小，通常不会触发。
   private static readonly MAX_SESSIONS = 1000
+  private readonly log: LogFn
   private sessions = new Map<string, Map<string, SkillState>>()
   // 每个会话「上次 messages.transform 估算的对话总 token」，作为 before 激活时的近似位置
   private lastToken = new Map<string, number>()
   // 每个会话已经历的 messages.transform 轮次，用于轮次维度的失效判断
   private lastTurn = new Map<string, number>()
+
+  constructor(log: LogFn) {
+    this.log = log
+  }
 
   activate(sessionId: string, skillName: string, mcpName: string): void {
     if (!this.sessions.has(sessionId)) {
@@ -265,11 +270,13 @@ class SessionManager {
       // 失效（轮次）：连续 inactiveTurns 轮未再次触发 → 释放，省 token
       if (turn - st.lastActiveTurn > inactiveTurns) {
         skills.delete(name)
+        this.log("info", `已失效 ${name}（轮次 ${turn - st.lastActiveTurn} > ${inactiveTurns}，session: ${sessionId}）`)
         continue
       }
       // 失效（token）：连续 inactiveTokens 未触发 → 释放，省 token
       if (currentToken - st.lastActiveAt > inactiveTokens) {
         skills.delete(name)
+        this.log("info", `已失效 ${name}（token 间隔 ${currentToken - st.lastActiveAt} > ${inactiveTokens}，session: ${sessionId}）`)
         continue
       }
       // 刷新：从未注入过，或距离上次注入已满 refreshTokens（注意力随 token 衰减）
@@ -412,7 +419,7 @@ const createPlugin = async (ctx: PluginContext) => {
   }
 
   const config = loadConfig(projectDir, log)
-  const sessionManager = new SessionManager()
+  const sessionManager = new SessionManager(log)
   const skillCache = new Map<string, LoadedSkill>()
 
   if (!config) {
