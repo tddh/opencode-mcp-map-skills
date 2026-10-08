@@ -1,8 +1,12 @@
 // 单文件（非多文件）实现：OpenCode 会将 plugins 目录下每个 .ts 独立作为插件加载，
 // 多文件相对 import 存在加载歧义风险。逻辑模块对应 docs/design.md，本文件按
 // types / config / skill-loader / session / hooks 分节。
+//
+// OpenCode V2 插件 API：export default { id, setup(ctx) }。V2 只识别 default 的
+// id 与 setup/effect，V1 的 { id, server: fn } / async function 默认导出不再加载。
+// hook 改为按域注册（ctx.tool.hook / ctx.session.hook），回调收到单一可变 event。
 
-import { readFileSync, existsSync, readdirSync } from "node:fs"
+import { readFileSync, existsSync, readdirSync, appendFileSync, mkdirSync } from "node:fs"
 import { join, resolve, dirname } from "node:path"
 import { homedir } from "node:os"
 
@@ -12,53 +16,82 @@ import { homedir } from "node:os"
 
 type LogFn = (level: "info" | "warn", message: string, extra?: unknown) => void
 
+// 插件 context：只声明本插件用到的字段（V1 的 ctx.directory → V2 ctx.location.directory）
 interface PluginContext {
-  directory?: string
-  client?: {
-    app?: {
-      log?: (input: {
-        body: { service: string; level: string; message: string; extra?: unknown }
-      }) => void
-    }
+  location?: { directory?: string }
+  tool?: {
+    hook: (
+      name: "execute.before",
+      callback: (event: ToolExecuteBeforeEvent) => void | Promise<void>,
+    ) => Promise<unknown>
+  }
+  session?: {
+    hook: (
+      name: "context",
+      callback: (event: SessionContextEvent) => void | Promise<void>,
+    ) => Promise<unknown>
   }
 }
 
-interface ToolBeforeInput {
+// ctx.tool.hook("execute.before") 的事件：完整工具参数在 event.input
+interface ToolExecuteBeforeEvent {
   tool?: string
   sessionID?: string
+  input?: unknown
 }
 
-// tool.execute.before 的第二个参数：完整工具参数在此（input 里拿不到 args）
-interface ToolBeforeOutput {
-  args?: unknown
-}
-
-interface MessageInfo {
-  sessionID?: string
-  id?: string
-  role?: string
-  providerID?: string
-  modelID?: string
-  error?: unknown
-}
-
+// V2 消息形态：{ role, content: [{ type: "text", text }] }
 interface MessagePart {
   type?: string
   text?: string
-  synthetic?: boolean
-  id?: string
-  sessionID?: string
-  messageID?: string
-  metadata?: Record<string, unknown>
 }
 
 interface ChatMessage {
-  info?: MessageInfo
-  parts?: MessagePart[]
+  role?: string
+  content?: MessagePart[]
 }
 
-interface TransformOutput {
+// ctx.session.hook("context") 的事件：sessionID 直给，messages 可原地改
+interface SessionContextEvent {
+  sessionID?: string
   messages?: ChatMessage[]
+}
+
+// ---------------------------------------------------------------------------
+// logger
+// ---------------------------------------------------------------------------
+
+// V2 插件 context 没有 V1 的 ctx.client.app.log，ctx.app 也只有 name/version/channel。
+// 实测 console 输出不会进入 opencode.log，故同时追加到独立日志文件，保证可观测性。
+const LOG_FILE = join(homedir(), ".local", "share", "opencode", "log", "mcp-map-skills.log")
+
+function stringifyExtra(extra: unknown): string {
+  if (extra === undefined) return ""
+  if (extra instanceof Error) return ` ${extra.message}`
+  if (typeof extra === "string") return ` ${extra}`
+  try {
+    return ` ${JSON.stringify(extra)}`
+  } catch {
+    return ` ${String(extra)}`
+  }
+}
+
+function createLogger(logPath: string | null): LogFn {
+  return (level, message, extra) => {
+    const fullMessage = `[mcp-map-skills] ${message}`
+    if (level === "warn") console.warn(fullMessage, extra ?? "")
+    else console.log(fullMessage, extra ?? "")
+    if (logPath) {
+      try {
+        appendFileSync(
+          logPath,
+          `${new Date().toISOString()} ${level.toUpperCase()} ${fullMessage}${stringifyExtra(extra)}\n`,
+        )
+      } catch {
+        // 日志写入失败不影响插件功能
+      }
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -198,7 +231,7 @@ function getSkill(
 interface SkillState {
   mcpName: string // 触发该 skill 的 MCP 名（如 "clum"），用于注入时标注来源
   lastActiveAt: number // 上次被对应 MCP 触发的对话 token 位置
-  lastActiveTurn: number // 上次被对应 MCP 触发的对话轮次（messages.transform 次数）
+  lastActiveTurn: number // 上次被对应 MCP 触发的对话轮次（context hook 次数）
   lastInjectedAt: number | null // 上次注入的对话 token 位置（null = 尚未注入）
 }
 
@@ -213,9 +246,9 @@ class SessionManager {
   private static readonly MAX_SESSIONS = 1000
   private readonly log: LogFn
   private sessions = new Map<string, Map<string, SkillState>>()
-  // 每个会话「上次 messages.transform 估算的对话总 token」，作为 before 激活时的近似位置
+  // 每个会话「上次 context hook 估算的对话总 token」，作为 before 激活时的近似位置
   private lastToken = new Map<string, number>()
-  // 每个会话已经历的 messages.transform 轮次，用于轮次维度的失效判断
+  // 每个会话已经历的 context hook 轮次，用于轮次维度的失效判断
   private lastTurn = new Map<string, number>()
 
   constructor(log: LogFn) {
@@ -243,7 +276,7 @@ class SessionManager {
     }
   }
 
-  // 每轮 messages.transform 调用：推进时间线，返回本轮需要注入的 skill 名
+  // 每轮 context hook 调用：推进时间线，返回本轮需要注入的 skill 名
   advance(
     sessionId: string,
     currentToken: number,
@@ -389,10 +422,11 @@ function formatSkillOutput(skill: LoadedSkill): string {
 
 // 估算当前对话累计 token（chars/4，生态事实标准）。用于衡量 skill 距离生成点的
 // 注意力距离，而非精确 token 数，粗略估算已足够。
+// V2 消息形态为 { role, content: [{ type: "text", text }] }。
 function estimateContextTokens(messages: ChatMessage[]): number {
   let chars = 0
   for (const msg of messages) {
-    const parts = msg.parts
+    const parts = msg.content
     if (!parts) continue
     for (const part of parts) {
       if (typeof part.text === "string") chars += part.text.length
@@ -405,112 +439,93 @@ function estimateContextTokens(messages: ChatMessage[]): number {
 // plugin entry
 // ---------------------------------------------------------------------------
 
-const createPlugin = async (ctx: PluginContext) => {
-  const projectDir: string = ctx.directory ?? process.cwd()
+const setup = async (ctx: PluginContext): Promise<void> => {
+  const projectDir: string = ctx.location?.directory ?? process.cwd()
 
-  const log: LogFn = (level, message, extra) => {
-    const fullMessage = `[mcp-map-skills] ${message}`
-    if (ctx.client?.app?.log) {
-      ctx.client.app.log({ body: { service: "mcp-map-skills", level, message: fullMessage, extra } })
-    } else {
-      const fn = level === "warn" ? console.warn : console.log
-      fn(fullMessage, extra ?? "")
-    }
+  let logPath: string | null = LOG_FILE
+  try {
+    mkdirSync(dirname(LOG_FILE), { recursive: true })
+  } catch {
+    logPath = null
   }
+  const log = createLogger(logPath)
 
   const config = loadConfig(projectDir, log)
+  if (!config) {
+    log("warn", "未找到配置（.opencode/mcp-map-skills.json 或 ~/.config/opencode/mcp-map-skills.json），插件不生效")
+    return
+  }
+
   const sessionManager = new SessionManager(log)
   const skillCache = new Map<string, LoadedSkill>()
 
-  if (!config) {
-    log("warn", "未找到配置（.opencode/mcp-map-skills.json 或 ~/.config/opencode/mcp-map-skills.json），插件不生效")
-    return {}
-  }
+  // 触发阶段：MCP 工具执行前标记对应 skill 激活
+  await ctx.tool?.hook("execute.before", (event) => {
+    const { tool, sessionID } = event
+    if (!sessionID || !tool) return
 
-  return {
-    "tool.execute.before": async (input: ToolBeforeInput, output: ToolBeforeOutput) => {
-      const { tool, sessionID } = input
-      if (!sessionID || !tool) return
+    const mcps = resolveMcp(tool, event.input, config.mcpSkillBindings)
+    if (mcps.length === 0) return
 
-      const mcps = resolveMcp(tool, output?.args, config.mcpSkillBindings)
-      if (mcps.length === 0) return
-
-      for (const mcp of mcps) {
-        const skillName = config.mcpSkillBindings[mcp]
-        const skill = getSkill(skillName, projectDir, skillCache, log)
-        if (!skill) {
-          log("warn", `找不到 skill "${skillName}"（MCP: ${mcp}），跳过`)
-          continue
-        }
-        sessionManager.activate(sessionID, skillName, mcp)
-        log("info", `已激活 ${skillName}（MCP: ${mcp}，工具: ${tool}）`)
+    for (const mcp of mcps) {
+      const skillName = config.mcpSkillBindings[mcp]
+      const skill = getSkill(skillName, projectDir, skillCache, log)
+      if (!skill) {
+        log("warn", `找不到 skill "${skillName}"（MCP: ${mcp}），跳过`)
+        continue
       }
-    },
+      sessionManager.activate(sessionID, skillName, mcp)
+      log("info", `已激活 ${skillName}（MCP: ${mcp}，工具: ${tool}）`)
+    }
+  })
 
-    "experimental.chat.messages.transform": async (_input: unknown, output: TransformOutput) => {
-      const messages = output?.messages
-      if (!messages || messages.length === 0) return
+  // 注入阶段：每个 LLM 请求前按 token 间隔，把 skill 全文注入到最新用户输入之前
+  await ctx.session?.hook("context", (event) => {
+    const messages = event.messages
+    const sessionID = event.sessionID
+    if (!messages || messages.length === 0 || !sessionID) return
 
-      const last = messages[messages.length - 1]
-      const sessionID = last?.info?.sessionID
-      if (!sessionID) return
+    const currentToken = estimateContextTokens(messages)
+    const names = sessionManager.advance(
+      sessionID,
+      currentToken,
+      config.refreshTokens,
+      config.inactiveTokens,
+      config.inactiveTurns,
+    )
+    if (names.length === 0) return
 
-      const currentToken = estimateContextTokens(messages)
-      const names = sessionManager.advance(
-        sessionID,
-        currentToken,
-        config.refreshTokens,
-        config.inactiveTokens,
-        config.inactiveTurns,
-      )
-      if (names.length === 0) return
+    const textParts: MessagePart[] = []
+    const injectedNames: string[] = []
+    for (const { name } of names) {
+      const skill = getSkill(name, projectDir, skillCache, log)
+      if (!skill) continue
+      injectedNames.push(skill.name)
+      textParts.push({ type: "text", text: formatSkillOutput(skill) })
+    }
+    if (textParts.length === 0) return
 
-      const now = Date.now()
-      const messageId = `mcp-map-skills-${now}-${Math.random().toString(36).slice(2)}`
-      const textParts: MessagePart[] = []
-      const injectedNames: string[] = []
-      for (const { name } of names) {
-        const skill = getSkill(name, projectDir, skillCache, log)
-        if (!skill) continue
-        injectedNames.push(skill.name)
-        textParts.push({
-          id: `mcp-map-skills-part-${now}-${Math.random().toString(36).slice(2)}`,
-          sessionID,
-          messageID: messageId,
-          type: "text",
-          text: formatSkillOutput(skill),
-          synthetic: true,
-        })
+    // 构造 assistant 消息 + text part，把 skill 全文注入到「最后一条 user 消息之前」。
+    // role 必须用 assistant 而非 user：user 会让 LLM 把 skill 内容误当作用户输入。
+    // （旧版伪造 completed ToolPart 序列化时被丢弃，是「不生效」根因；text part 一定进入上下文。）
+    const injected: ChatMessage = { role: "assistant", content: textParts }
+    let lastUserIndex = -1
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i]?.role === "user") {
+        lastUserIndex = i
+        break
       }
-      if (textParts.length === 0) return
-
-      // 构造 assistant 消息 + synthetic 文本 part，把 skill 全文注入到「最后一条 user 消息之前」。
-      // role 必须用 assistant 而非 user：user 会让 LLM 把 skill 内容误当作用户输入。
-      // 旧版伪造 completed ToolPart（callID 无配对 tool call）序列化时被丢弃，是「不生效」根因；
-      // text part 一定进入 LLM 上下文，synthetic 标记为合成消息（非真实对话内容）。
-      const info: MessageInfo = {
-        id: messageId,
-        role: "assistant",
-        sessionID,
-      }
-      let lastUserIndex = -1
-      for (let i = messages.length - 1; i >= 0; i--) {
-        if (messages[i]?.info?.role === "user") {
-          lastUserIndex = i
-          break
-        }
-      }
-      if (lastUserIndex === -1) {
-        messages.push({ info, parts: textParts })
-      } else {
-        messages.splice(lastUserIndex, 0, { info, parts: textParts })
-      }
-      log("info", `已注入 ${textParts.length} 个 skill（${injectedNames.join(", ")}）`)
-    },
-  }
+    }
+    if (lastUserIndex === -1) {
+      messages.push(injected)
+    } else {
+      messages.splice(lastUserIndex, 0, injected)
+    }
+    log("info", `已注入 ${textParts.length} 个 skill（${injectedNames.join(", ")}）`)
+  })
 }
 
 export default {
   id: "mcp-map-skills",
-  server: createPlugin,
+  setup,
 }

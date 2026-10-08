@@ -39,22 +39,22 @@
 
 ### 3.1 OpenCode 插件 hook 能力
 
-| Hook | 签名要点 | 对本插件的影响 |
+| Hook（V2） | 签名要点 | 对本插件的影响 |
 |---|---|---|
-| `tool.execute.before` | `(input: {tool, sessionID, callID}, output: {args})` | **主触发点**：按 `input.tool` 前缀匹配 + 解析 `output.args` 识别 `execute` / `skill_mcp` 间接调用 |
-| `tool.execute.after` | `(input: {tool, sessionID, callID, args}, output: {...})` | 未使用（before 触发更早且已足够） |
-| `experimental.chat.messages.transform` | `(input: {}, output: {messages})` | **主注入点**：splice 一条 assistant 消息（含已完成 skill ToolPart）到最新用户输入之前 |
-| `experimental.chat.system.transform` | `(input: {sessionID?, model}, output: {system})` | 未使用（改用 messages.transform 注入生成点附近） |
+| `ctx.tool.hook("execute.before")` | `(event: {tool, sessionID, agent, messageID, id, input})` | **主触发点**：按 `event.tool` 前缀匹配 + 解析 `event.input` 识别 `execute` / `skill_mcp` 间接调用 |
+| `ctx.tool.hook("execute.after")` | 同上 + 执行结果 | 未使用（before 触发更早且已足够） |
+| `ctx.session.hook("context")` | `(event: {sessionID, model, system, messages, options, agent, tools})` | **主注入点**：splice 一条 assistant 文本消息到最新用户输入之前；只作用于本次模型请求，不落盘 |
+| `ctx.session.hook("compaction"/"generate"/"title")` | 各自的模型请求 | 未使用（只挂 `context`，即 agent 主循环） |
 
-> 关键事实：`messages.transform` 的 `input` 是空对象 `{}`，**拿不到 sessionID**。sessionID 需从 `output.messages` 最后一条消息的 `info.sessionID` 里提取。
+> 关键事实：V2 的 `context` hook 事件**直接携带 `sessionID`**（不像 V1 的 `messages.transform` 需从末条消息 `info.sessionID` 里提取）。
 
 ### 3.2 关键已知坑（必须规避）
 
 | 坑 | 编号 / 状态 | 规避 |
 |---|---|---|
-| `tool.execute.before` 的 args 在**第二个参数** `output.args`，**不在 input 里** | #18489（open） | 插件只声明 `input` 会漏掉参数；须同时声明 `output` 才能读 `output.args` |
+| V1：`tool.execute.before` 的 args 在**第二个参数** `output.args`，**不在 input 里** | #18489（open） | V2 已改为单一 `event.input`，直接读即可（此坑仅 V1 适用） |
 | `tool.definition` 对 MCP 工具**不触发** | #41297 | 不用 tool.definition 注入 |
-| headless 模式（`opencode run`）下 `tool.execute.*` **不触发** | #41422（open） | 明确支持范围为 TUI 交互会话 |
+| headless 模式（`opencode run`）下工具执行 hook **不触发** | #41422（open） | 明确支持范围为 TUI 交互会话 |
 | 插件注册名为 `skill` 的工具会**覆盖原生 SkillTool** | #14534 | 不注册任何名为 `skill` 的工具 |
 | MCP 工具调用触发 hook 是较晚才修复的 | #2319/#2320 | 当前版本已修复，可依赖 |
 
@@ -85,27 +85,28 @@ OpenCode 会话
    ├─ 模型调用 MCP 工具（clum_exec / clum_host_list ...）
    │      │
    │      ▼
-   │  tool.execute.before  ──识别 MCP──▶ session.activate(sessionID, "clum-mcp")
+   │  ctx.tool.hook("execute.before")  ──识别 MCP──▶ session.activate(sessionID, "clum-mcp")
    │                                      │
    ▼                                      ▼
-experimental.chat.messages.transform  ◀── 估算 token → session.advance(...)
+ctx.session.hook("context")           ◀── 估算 token → session.advance(...)
    │                                      │
    │  读 skillLoader（.config/opencode/skills/clum-mcp/SKILL.md，带缓存）
    │                                      │
    ▼                                      ▼
-splice 一条 assistant 消息（skill 工具调用结果）到最新用户输入之前  ── 按 refreshTokens 间隔刷新，紧邻生成点，抗遗忘 + 抗 compaction
+splice 一条 assistant 文本消息（skill 全文）到最新用户输入之前  ── 按 refreshTokens 间隔刷新，紧邻生成点，抗遗忘 + 抗 compaction
 ```
 
 ### 5.2 模块划分（单文件分节）
 
 | 节 | 职责 | 对应代码位置 |
 |---|---|---|
-| `types` | 最小类型定义（替代 `any`，保持零依赖） | `PluginContext` / `MessageInfo` / `ChatMessage` 等 |
+| `types` | 最小类型定义（替代 `any`，保持零依赖） | `PluginContext` / `ToolExecuteBeforeEvent` / `SessionContextEvent` / `ChatMessage` 等 |
+| `logger` | 日志：console + 追加到独立文件（V2 无 `app.log`，且 console 不进 `opencode.log`） | `createLogger` / `LOG_FILE` / `stringifyExtra` |
 | `config` | 加载 `.opencode/mcp-map-skills.json` 或 `~/.config/opencode/mcp-map-skills.json`，解析并严格校验绑定 | `loadConfig` |
 | `skill-loader` | 定位并读取 SKILL.md（路径校验 + frontmatter 解析 + 文件采样 + 内存缓存） | `getSkill` / `findSkillFile` / `parseFrontmatter` / `listSkillFiles` |
 | `session` | 会话级状态机：`Map<sessionID, Map<skillName, SkillState>>`，token/轮次驱动的激活/刷新/失效 | `SessionManager` |
-| `hooks` | `tool.execute.before`（触发）+ `messages.transform`（注入） | `matchMcp` / `formatSkillOutput` |
-| `plugin entry` | 插件入口：组装 config + loader + session + hooks，返回 `{ id, server }` | `createPlugin` / `export default` |
+| `hooks` | `ctx.tool.hook("execute.before")`（触发）+ `ctx.session.hook("context")`（注入） | `matchMcp` / `resolveMcp` / `formatSkillOutput` |
+| `plugin entry` | 插件入口：组装 config + loader + session + hooks，`export default { id, setup }` | `setup` / `export default` |
 
 ### 5.3 数据流
 
@@ -114,17 +115,17 @@ splice 一条 assistant 消息（skill 工具调用结果）到最新用户输�
   mcpSkillBindings: { "clum": "clum-mcp" }  ── 启动时读入，常驻内存
 
 [触发阶段，每个 MCP 调用]
-  tool.execute.before(tool="clum_exec", sessionID=xxx)
-    → matchMcp(tool) 命中 "clum"
+  ctx.tool.hook("execute.before") 事件 (tool="clum_exec", sessionID=xxx, input=…)
+    → resolveMcp(tool, event.input) 命中 "clum"
     → getSkill("clum-mcp")（首次读盘，之后缓存）
     → session.activate(sessionID, "clum-mcp")
 
 [注入阶段，每个 LLM 请求]
-  messages.transform(output.messages)
-    → 从最后一条消息 info 提取 sessionID
+  ctx.session.hook("context") 事件 (sessionID, messages, …)
+    → sessionID 直取 event.sessionID
     → session.advance(...) 返回本轮需注入的 skill
     → 逐个取 skill 全文
-    → 构造 skill 工具调用结果（<skill_content> 原生格式），splice 一条 assistant 消息到最新用户输入之前
+    → 构造 assistant 文本消息（<skill_content> 原生格式），splice 到最新用户输入之前
 ```
 
 ### 5.4 文件结构
@@ -200,7 +201,7 @@ interface LoadedSkill {
 interface SkillState {
   mcpName: string           // 触发该 skill 的 MCP 名（如 "clum"），用于注入时标注来源
   lastActiveAt: number      // 上次被 MCP 触发的 token 位置
-  lastActiveTurn: number    // 上次被 MCP 触发的轮次（messages.transform 次数）
+  lastActiveTurn: number    // 上次被 MCP 触发的轮次（context hook 次数）
   lastInjectedAt: number | null // 上次注入的 token 位置（null = 尚未注入）
 }
 
@@ -218,7 +219,7 @@ class SessionManager { // MAX_SESSIONS = 1000
 
 ### 6.3 MCP 识别逻辑（`resolveMcp`）
 
-**输入**：`tool`（工具名）+ `args`（`output.args` 完整参数）；**输出**：命中的 MCP 名列表（空 = 非目标调用）。
+**输入**：`event.tool`（工具名）+ `event.input`（完整参数）；**输出**：命中的 MCP 名列表（空 = 非目标调用）。
 
 ```
 function resolveMcp(tool, args, bindings) -> string[]:
@@ -281,7 +282,7 @@ getSkill(name, cache):
 ```
 状态：session 级，Map<sessionID, Map<skillName, SkillState>>
 
-  [未激活]  ──tool.execute.before 命中 MCP──▶  [已激活]
+  [未激活]  ──execute.before 命中 MCP──▶  [已激活]
                  set.add(skillName)
 
   有「失效」路径（轮次与 token 并行，任一先到即失效）：
@@ -290,14 +291,14 @@ getSkill(name, cache):
   （OpenCode 无可靠的 session 结束 hook，无法精确清理；个人使用量级极小，通常不触发）
 ```
 
-### 6.6 `tool.execute.before` 处理流程
+### 6.6 `execute.before` hook 处理流程
 
 ```
-输入: (input: { tool, sessionID, callID }, output: { args })
+输入: event = { tool, sessionID, agent, messageID, id, input }
 输出: （不改动）
 
 1  if !sessionID or !tool: return               # 防御
-2  mcps = resolveMcp(tool, output.args, config.mcpSkillBindings)
+2  mcps = resolveMcp(event.tool, event.input, config.mcpSkillBindings)
 3  if mcps.empty: return                        # 非目标 MCP，忽略
 4  for mcp in mcps:
 5    skillName = config.mcpSkillBindings[mcp]
@@ -309,35 +310,35 @@ getSkill(name, cache):
 9    log.info("已激活 {skillName}（MCP: {mcp}，工具: {tool}）")
 ```
 
-> 注：`tool.execute.before` 在「工具真正执行前」触发，比 `after` 更早地把 skill 标记为激活，使紧接着的下一个 LLM 请求就能注入。`execute`（code-mode）在子工具逐个执行时还会以子工具名各触发一次本 hook（新版），与路径 2 的兜底解析共存、幂等无害。
+> 注：`ctx.tool.hook("execute.before")` 在「工具真正执行前」触发，比 `execute.after` 更早地把 skill 标记为激活，使紧接着的下一个 LLM 请求就能注入。`execute`（code-mode）在子工具逐个执行时还会以子工具名各触发一次本 hook（新版），与路径 2 的兜底解析共存、幂等无害。
 
-### 6.7 `experimental.chat.messages.transform` 处理流程
+### 6.7 `context` hook 处理流程
 
 ```
-输入: {}                                        # 空对象，无 sessionID / model
-输出: { messages: [...] }
+输入: event = { sessionID, model, system, messages, options, agent, tools }
 
-1  if !messages or messages.empty: return
-2  last = messages[last]
-3  sessionID = last.info.sessionID               # 从最后一条消息 info 提取
-4  if !sessionID: return                         # 防御
-5  names = session.advance(sessionID, currentToken, refreshTokens, inactiveTokens, inactiveTurns)
-6  if names.empty: return                        # 未激活任何 MCP → 零注入
-7  toolParts = []
-8  for { name } in names:
+1  messages = event.messages; sessionID = event.sessionID
+2  if !messages or messages.empty or !sessionID: return   # 防御
+3  currentToken = estimateContextTokens(messages)          # chars/4
+4  names = session.advance(sessionID, currentToken, refreshTokens, inactiveTokens, inactiveTurns)
+5  if names.empty: return                                  # 未激活任何 MCP → 零注入
+6  textParts = []
+7  for { name } in names:
        skill = getSkill(name)
-       if skill: toolParts.push(构造 completed skill ToolPart，output = formatSkillOutput(skill))
-9  if toolParts.empty: return
-10 构造一条 role="assistant" 的消息（parts = toolParts），splice(-1, 0) 插到 messages 倒数第二位（最新用户输入之前）
+       if skill: textParts.push({ type: "text", text: formatSkillOutput(skill) })
+8  if textParts.empty: return
+9  injected = { role: "assistant", content: textParts }
+10 splice 到最新 user 消息之前（找不到 user 则 push 到末尾）
 ```
 
 **关键点**：
 - **注入到最新用户输入之前**，而非 system prompt 开头：skill 位于**生成点附近**（只隔一条真实用户消息，注意力就近），比 system 开头的注入更不容易被注意力衰减。
-- **模拟 skill 工具调用结果**：注入的是一条 assistant 消息 + 已完成（completed）的 `skill` ToolPart，skill 全文放在 `state.output`——与模型真的调用 `skill(name=...)` 工具后的消息形态完全一致，走原生 tool result 通道。`role` 必须是 assistant（否则 `toModelMessagesEffect` 不识别 tool part），`error` 必须清空（否则该消息被跳过）。
+- **assistant 文本消息**：注入一条 `{ role: "assistant", content: [{ type: "text", text }] }`。`role` 必须是 assistant 而非 user，否则 LLM 会把 skill 内容误当作用户输入。（早期版本伪造 completed `skill` ToolPart，序列化时被丢弃，是「不注入」根因；text part 一定会进入请求。）
+- **只作用于本次模型请求**：`context` hook 的修改不落盘、不改持久历史；`context` 只覆盖 agent 主循环（compaction/generate/title 各有独立 hook，本插件不挂）。
 - **按 token 间隔才插入一条新消息**：因为旧的历史会被截断 / compaction，token 衰减或历史裁剪时才重新注入，才能保证 skill 始终在场。这是抗遗忘的核心。
 - token 成本近似常量：每轮插入一条（已激活 skill 合计），旧的一条会被历史窗口剔除。
 
-`formatSkillOutput(skill)`（完全复刻原生 SkillTool 的 output 格式，正文原样不转义）：
+`formatSkillOutput(skill)`（复刻原生 SkillTool 的 output 文本格式，正文原样不转义）：
 
 ```
 <skill_content name="clum-mcp">
@@ -355,19 +356,12 @@ Note: file list is sampled.
 </skill_content>
 ```
 
-对应 ToolPart：
+对应注入消息（V2 Message 形态）：
 
 ```
 {
-  type: "tool", tool: "skill", callID: "<唯一ID>",
-  state: {
-    status: "completed",
-    input: { name: "clum-mcp" },
-    output: "<上面 formatSkillOutput 的结果>",
-    title: "Loaded skill: clum-mcp",
-    metadata: { name: "clum-mcp", dir: "/path/to/clum-mcp" },
-    time: { start, end },          // 无 compacted 字段，否则 output 被清空
-  }
+  role: "assistant",
+  content: [{ type: "text", text: "<上面 formatSkillOutput 的结果>" }]
 }
 ```
 
@@ -375,18 +369,18 @@ Note: file list is sampled.
 
 | 场景 | 处理 |
 |---|---|
-| `messages.transform` 拿不到 sessionID | 直接 return（无会话无状态） |
+| `context` hook 拿不到 sessionID | 直接 return（无会话无状态） |
 | 未配置 `mcpSkillBindings` | 一切 hook 直接短路，零开销 |
-| 配置了但 skill 文件不存在 | `tool.execute.before` 记 warn 日志，不标记激活（下次调用会重试） |
+| 配置了但 skill 文件不存在 | `execute.before` 记 warn 日志，不标记激活（下次调用会重试） |
 | 同一 MCP 反复调用 | 刷新该 skill 的 `lastActiveAt` 与 `lastActiveTurn`（延长活跃期），不强制重复注入 |
-| 多个 MCP 激活 | 全部作为多个 ToolPart 注入到同一条 assistant 消息 |
+| 多个 MCP 激活 | 全部作为多个 text part 注入到同一条 assistant 消息 |
 | skill 名含 `..` / `/` / `\` | `findSkillFile` 直接 return null，防御路径遍历 |
 | 对话历史被裁剪（token 回退） | `advance` 检测 `currentToken < lastActiveAt`，重置基准 + 强制重注入 |
-| headless 模式 | `tool.execute.*` 不触发（#41422），功能静默失效——文档标注"仅支持 TUI 交互" |
+| headless 模式 | 工具执行 hook 不触发（#41422），功能静默失效——文档标注"仅支持 TUI 交互" |
 
 ### 6.9 省 token 策略
 
-1. **未激活零成本**：没用任何 MCP 的会话，`messages.transform` 直接 return，0 额外 token。
+1. **未激活零成本**：没用任何 MCP 的会话，`context` hook 直接 return，0 额外 token。
 2. **按会话隔离**：session A 激活了 clum，只影响 session A；session B 完全不受影响。
 3. **token 驱动刷新**：仅每累积 refreshTokens 才重新注入一次，而非每轮，大幅降低长对话平均开销。
 4. **自动失效**：连续 inactiveTurns 轮、或连续 inactiveTokens token 未触发的 skill 自动释放（任一先到即失效），不再产生注入成本。
@@ -403,30 +397,32 @@ Note: file list is sampled.
 
 | # | 决策 | 备选 | 理由 |
 |---|---|---|---|
-| D1 | 走 `tool.execute.before` 触发（而非 after） | after | 只按 tool 前缀匹配、不需要 args；before 触发更早，skill 激活后紧接着的请求即可注入 |
-| D2 | `messages.transform` 注入最新用户输入之前（而非 system.transform 注入 system 最前） | system.transform | 注入到生成点附近，注意力权重更高；垫在输入前避免规则被当作最新指令；messages.transform 的 input 拿不到 sessionID 但可从消息 info 提取，可行 |
+| D1 | 走 `ctx.tool.hook("execute.before")` 触发（V1 名 `tool.execute.before`）（而非 after） | after | before 触发更早，skill 激活后紧接着的请求即可注入 |
+| D2 | `ctx.session.hook("context")` 注入最新用户输入之前（而非改 `event.system` 注入 system 最前） | system | 注入到生成点附近，注意力权重更高；垫在输入前避免规则被当作最新指令；V2 的 `context` 事件直接携带 `sessionID` |
 | D3 | 自解析 SKILL.md，不依赖 OMO 内部 API | 复用 `resolveSkillContentAsync` | OMO 内部包非稳定公共 API，聚焦版逻辑简单，自解析更可控 |
 | D4 | 本地目录挂载，不发 npm | npm 发布 | 个人使用、快速迭代；本地 `.ts` 直接跑 |
 | D5 | 不注册 `skill` 同名工具 | — | 规避 #14534 双缓存分歧 |
 | D6 | token 驱动刷新（每 refreshTokens 重注入）而非每轮注入 | 每轮全量注入 | 注意力随 token 数量衰减而非轮数；每轮注入在长对话中浪费严重，token 间隔注入匹配衰减速率 |
 | D7 | inactiveTokens 自动失效 | 注入后常驻到 compaction（社区默认） | 社区无「停用」先例，但常驻在超大上下文场景浪费严重；token 失效是对官方行为的改进 |
 | D8 | inactiveTurns 轮次失效（与 token 失效并行，任一先到即失效） | 仅按 token 失效 | 偶然调用一次 MCP 后，若后续连续几轮未再用，token 阈值（60000）太宽松、skill 长时间在场浪费 token；轮次阈值更快释放 |
-| D9 | 以原生 skill 工具调用结果形态注入（assistant + completed ToolPart） | 构造 user 消息注入（`<preloaded-skill>` 包裹） | 与模型真的调 `skill` 工具后的消息形态一致，走原生 tool result 通道；正文零转义零截断；user 消息注入的祈使式包裹易触发模型注入防御 |
-| D10 | 识别三条 MCP 触发路径（直接前缀 / execute code / skill_mcp mcp_name） | 仅前缀匹配（旧） | Agent 会经 `execute` 沙箱或 `skill_mcp` 插件间接调 MCP，顶层工具名不再是 `clum_exec`，单靠前缀匹配漏判；`tool.execute.before` 的 `output.args` 可读完整参数，据此补齐两条间接路径 |
+| D9 | 以 assistant 文本消息形态注入（V2 Message：`{role:"assistant", content:[{type:"text", text}]}`） | 构造 user 消息注入 / completed ToolPart | user 消息的祈使式包裹易触发模型注入防御；伪造的 ToolPart 序列化时会被丢弃（历史「不注入」根因），text part 一定会进入请求；正文零转义零截断 |
+| D10 | 识别三条 MCP 触发路径（直接前缀 / execute code / skill_mcp mcp_name） | 仅前缀匹配（旧） | Agent 会经 `execute` 沙箱或 `skill_mcp` 插件间接调 MCP，顶层工具名不再是 `clum_exec`，单靠前缀匹配漏判；V2 的 `event.input` 可读完整参数，据此补齐两条间接路径 |
+| D11 | V2 插件入口 `export default { id, setup }`，hook 按域注册（`ctx.tool.hook` / `ctx.session.hook`） | V1 `{ id, server }` | V2 只识别 default 的 `id` + `setup`/`effect`，V1 形态不再加载 |
+| D12 | 日志追加到独立文件 `~/.local/share/opencode/log/mcp-map-skills.log` | 仅 `console` | V2 插件 context 无 `app.log`，且实测 `console` 输出不进 `opencode.log` |
 
 ---
 
 ## 8. 已知坑清单（实现时必须遵守）
 
-1. `tool.execute.before` 的 args 在第二个参数 `output.args`（不在 `input` 里，见 #18489）→ 插件必须声明 `output` 才能读参数；只声明 `input` 会漏掉 `execute` / `skill_mcp` 的间接调用。
+1. V2 的 `ctx.tool.hook("execute.before")` 事件把完整参数放在 `event.input`（V1 在第二个参数 `output.args`，见 #18489）→ 直接读 `event.input`。
 2. `tool.definition` 对 MCP 不触发（#41297）→ 不用它注入。
-3. headless 不触发 `tool.execute.*`（#41422）→ 支持范围 = TUI。
+3. headless 不触发工具执行 hook（#41422）→ 支持范围 = TUI。
 4. 不注册 `skill` 工具（#14534）。
 5. MCP 工具名前缀不可逆（sanitize）→ 配置显式声明前缀。
-6. 默认导出必须是 `{ id, server }` 结构（OpenCode v1 loader 对 raw function 默认导出会遍历具名导出并报错）。
-7. `messages.transform` 的 `input` 是空对象 → sessionID 必须从 `output.messages` 最后一条的 `info.sessionID` 提取，不能依赖 `input.sessionID`。
-8. `execute`（code-mode）旧版不重触发子工具 hook → 需解析 `args.code`；新版会以子工具名重触发（`code-mode.ts#L134-145`），两条路径幂等共存。
-9. `skill_mcp`（oh-my-openagent 插件）内部用自有 client 直连、绝不重触发子工具 hook → 只能读 `args.mcp_name` / `args.tool_name`。
+6. V2 默认导出必须是 `{ id, setup }`；V1 的 `{ id, server }` / 默认导出函数在 V2 不加载（报 `Plugin must export a default definition with an id and an effect or setup function`）。改完文件需先 `opencode api delete /api/debug/location` 再 `opencode api post /api/location/reload`（单独 `opencode reload` 会命中进程内模块缓存，不生效）。
+7. V2 `ctx.session.hook("context")` 直接提供 `event.sessionID`（V1 的 `messages.transform` 才需要从末条消息 `info.sessionID` 提取）。
+8. `execute`（code-mode）旧版不重触发子工具 hook → 需解析 `event.input.code`；新版会以子工具名重触发，两条路径幂等共存。
+9. `skill_mcp`（oh-my-openagent 插件）内部用自有 client 直连、绝不重触发子工具 hook → 只能读 `event.input.mcp_name`。
 
 ---
 
